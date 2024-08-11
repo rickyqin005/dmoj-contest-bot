@@ -10,7 +10,8 @@ const DMOJ_RATING = [
   [1599, 'blue'],
   [1899, 'purple'],
   [2399, 'yellow'],
-  [999999999, 'red']
+  [2999, 'red'],
+  [999999999, 'target']
 ];
 
 function setW(string, alignment, width) {
@@ -33,7 +34,9 @@ function getUserColour(user) {
 }
 function userFormatRating(user) {
   let ratingStr = (user.old_rating == null ? '' : user.old_rating.toString());
-  return `:${getUserColour(user)}_circle: \`${setW(ratingStr, 'left', 4)}\`   ${user.user}`;
+  let colour = getUserColour(user);
+  if (colour == 'target') return `:dart: \`${setW(ratingStr, 'left', 4)}\`   ${user.user}`;
+  return `:${colour}_circle: \`${setW(ratingStr, 'left', 4)}\`   ${user.user}`;
 }
 function getProblemScore(solution) {
   return (solution == null ? 0 : solution.points);
@@ -53,42 +56,62 @@ function participantStr(user, rank) {
 }
 
 let Contest = {};
-let lastCheck = '';
+let lastCheck = Date.now();
 let userParticipations = new Map(); // username -> ranking[i] object
+let userParticipationsTracked = new Map();// username -> latest submission id
 let userWindowFinished = new Map(); // username -> ranking[i] object
 
 // HTTP requests
 const axios = require('axios');
 const fs = require('fs');
-const httpHeader = {
-  'headers': {
-    'Authorization': `Bearer ${process.env.DMOJ_API_TOKEN}`
-  }
-};
-function getDMOJAPIUrl() {
-  return `https://dmoj.ca/api/v2/contest/${process.env.CONTEST_KEY}`;
+
+function getDMOJContestAPI() {
+  return axios.get(`https://dmoj.ca/api/v2/contest/${process.env.CONTEST_KEY}`, {
+    'headers': {
+      'Authorization': `Bearer ${process.env.DMOJ_API_TOKEN}`
+    }
+  });
+}
+
+async function getLastUserSubmission(user) {
+  return (await axios.get(`https://dmoj.ca/api/v2/submissions?user=${user}&page=last`, {
+    'headers': {
+      'Authorization': `Bearer ${process.env.DMOJ_API_TOKEN}`
+    }
+  })).data.data.objects.slice(-1)[0];
+}
+
+function getSubmissionDetailed(id) {
+  return axios.get(`https://dmoj.ca/api/v2/submission/${id}`, {
+    'headers': {
+      'Authorization': `Bearer ${process.env.DMOJ_API_TOKEN}`
+    }
+  });
 }
 
 async function initializeContest() {
   try {
-    let res = await axios.get(getDMOJAPIUrl(), httpHeader);
-    await fs.writeFile("contest.json", JSON.stringify(res.data), () => { });
+    let res = await getDMOJContestAPI();
+    fs.writeFile("contest.json", JSON.stringify(res.data), () => { });
     Contest = res.data.data.object;// update the contest object
     userParticipations = new Map();
     userWindowFinished = new Map();
-
     let ranking = Contest.rankings;
     for (let i = 0; i < ranking.length; i++) {
       userParticipations.set(ranking[i].user, ranking[i]);
+
       if (Date.parse(ranking[i].end_time) <= Date.now()) {
         userWindowFinished.set(ranking[i].user, ranking[i]);
       }
     }
+
   } catch (error) {
     console.log(error);
-    setTimeout(initializeContest, 6000);
+    console.log('Will try again in 15 seconds...');
+    setTimeout(initializeContest, 15000);
   }
 }
+
 
 client.on('ready', () => {
   console.log(`Logged in as ${client.user.tag}!`);
@@ -96,6 +119,7 @@ client.on('ready', () => {
 client.on('debug', console.log);
 
 async function run() {
+  console.log("version 1.2.4");
   await initializeContest();
   await client.login(process.env.DISCORD_TOKEN);
   setTimeout(refreshContest, 0);
@@ -105,21 +129,23 @@ run();
 
 async function refreshContest() {
   async function sendMessage(channel, message, pingsUser = false, numPings = 1) {
-    // if(pingsUser) {
-    //     let finalMessage = `<@&${process.env['CONTEST_NOTIF']}>`;
-    //     finalMessage += '\n' + message;
-    //     channel.send(finalMessage);
-    // } else {
-    channel.send(message);
-    // }
+    if (pingsUser) {
+      let finalMessage = '';
+      for (let i = 0; i < numPings; i++) finalMessage += `<@&${process.env['CONTEST_NOTIF']}>`;
+      finalMessage += '\n' + message;
+      channel.send(finalMessage);
+    } else {
+      channel.send(message);
+    }
     console.log(message);
   }
 
   try {
-    let res = await axios.get(getDMOJAPIUrl(), httpHeader);
-    await fs.writeFile("contest.json", JSON.stringify(res.data), () => { });
+    let res = await getDMOJContestAPI();
+    fs.writeFile("contest.json", JSON.stringify(res.data), () => { });
     Contest = res.data.data.object;// update the contest object
     const ranking = Contest.rankings;
+    const problems = Contest.problems.map((x) => x.code);
     const numProblems = Contest.problems.length;
     const channelBotFeed = await client.channels.fetch(process.env['CONTEST_FEED_CHANNEL_ID']);
 
@@ -128,57 +154,153 @@ async function refreshContest() {
       maxScore += Contest.problems[i].points;
     }
 
+    // track changes
     for (let i = 0; i < ranking.length; i++) {
+      let messageStr = '';
+      let pingsUser = false;
+
+      // check change in scoreboard
       if (userParticipations.get(ranking[i].user) == undefined) {
-        userParticipations.set(ranking[i].user, ranking[i]);
-        let messageStr = `${userFormatRating(ranking[i])} has joined the contest!`;
-        await sendMessage(channelBotFeed, messageStr, ranking[i].old_rating >= 2400, 1);
+        messageStr = `${userFormatRating(ranking[i])} has joined the contest!`;
+        pingsUser = (ranking[i].old_rating >= 2400);
+
       } else {
         let oldInfo = userParticipations.get(ranking[i].user);
+
         for (let j = 0; j < numProblems; j++) {
           let oldScore = getProblemScore(oldInfo.solutions[j]);
           let newScore = getProblemScore(ranking[i].solutions[j]);
           if (newScore - oldScore > 0) {
-            let messageStr = '';
             if (newScore == Contest.problems[j].points) {
               messageStr = `${userFormatRating(ranking[i])} has solved P${j + 1}!`;
-              await sendMessage(channelBotFeed, messageStr, (ranking[i].old_rating >= 2400) || (j + 1 >= 5), 1);
+              pingsUser = ((ranking[i].old_rating >= 2600) || (j + 1 >= 4));
             } else {
-              messageStr = `${userFormatRating(ranking[i])} has solved P${j + 1} partials (${newScore} points)!`;
-              await sendMessage(channelBotFeed, messageStr, (ranking[i].old_rating >= 2400 && (j + 1 >= 5)), 1);
+              messageStr = `${userFormatRating(ranking[i])} has solved P${j + 1} partials`;
+              if (userParticipationsTracked.get(ranking[i].user) == undefined) {
+                messageStr += ` (${newScore}/${Contest.problems[j].points} points)`;
+              }
+              messageStr += '!';
+              pingsUser = (ranking[i].old_rating >= 2600);
             }
 
             if (newScore == maxScore) {
               messageStr = `${userFormatRating(ranking[i])} has AKed the contest!`;
-              await sendMessage(channelBotFeed, messageStr, true, 5);
+              pingsUser = true;
             }
 
           } else if (newScore == 0) {
             if (oldInfo.solutions[j] == null && ranking[i].solutions[j] != null) {// new attempt
-              if ((j + 1) >= 3) {// send message for Px-Py
+              if ((j + 1) >= 4) {// send message for Px-Py
                 messageStr = `${userFormatRating(ranking[i])} has attempted P${j + 1}!`;
-                await sendMessage(channelBotFeed, messageStr, false, 1);
               }
             }
           }
         }
+      }
+
+      // track users in tracker, adds submission info if applicable
+      if (userParticipationsTracked.get(ranking[i].user) != undefined) {
+        let lastid = userParticipationsTracked.get(ranking[i].user);
+        latestsub = await getLastUserSubmission(ranking[i].user);
+
+        // check if new submission was made to a contest problem
+        if (latestsub.id != lastid && problems.includes(latestsub.problem) &&
+          !(['CE', 'IE', 'AB'].includes(latestsub.result))) {
+          latestsub = (await getSubmissionDetailed(latestsub.id)).data.data.object;
+
+          // new submission must be finished grading
+          if (latestsub.status == 'D') {
+            userParticipationsTracked.set(ranking[i].user, latestsub.id);
+
+            if (messageStr == '') {
+              messageStr += `${userFormatRating(ranking[i])} has submitted to `;
+              messageStr += `${latestsub.problem.slice(-2).toUpperCase()}:`;
+            }
+            messageStr += '\n';
+            if (latestsub.result == 'AC') messageStr += `:white_check_mark: **AC**`;
+            else {
+              for (let j = 0; j < latestsub.cases.length; j++) {
+                let batch = latestsub.cases[j];
+                let flag = false;
+                for (let k = 0; k < batch.cases.length; k++) {
+                  let curr = batch.cases[k];
+                  if (curr.status != 'AC') {
+                    messageStr += `:x: **${curr.status}** on `;
+                    messageStr += `Batch ${j + 1}, Case ${k + 1}`;
+                    flag = true; break;
+                  }
+                }
+                if (flag) break;
+              }
+            }
+            messageStr += `, received ${latestsub.case_points}/${latestsub.case_total} points`;
+          }
+        }
+      }
+
+      // send message if applicable
+      if (messageStr != '') {
+        await sendMessage(channelBotFeed, messageStr, pingsUser, 1);
+        messageStr = '';
+      }
+      pingsUser = false;
+
+      // check time left
+      if (userParticipations.get(ranking[i].user) == undefined) {
+        userParticipations.set(ranking[i].user, ranking[i]);
+      } else {
+        let oldInfo = userParticipations.get(ranking[i].user);
+
+        // send message for every hour that passes
+        let oldtimeLeft = (Date.parse(ranking[i].end_time) - lastCheck) / 1000;
+        let newtimeLeft = (Date.parse(ranking[i].end_time) - Date.now()) / 1000;
+        let intervals = [7200, 3600, 1800, 900, 300];
+        if (newtimeLeft > 0 && oldtimeLeft < Contest.time_limit &&
+          (ranking[i].old_rating >= 2400 || userParticipationsTracked.get(ranking[i].user) != undefined)) {
+          for (let j = 0; j < intervals.length; j++) {
+            if (newtimeLeft < intervals[j] && intervals[j] < oldtimeLeft) {
+              let hours = Math.floor(intervals[j] / 3600);
+              let minutes = Math.floor((intervals[j] % 3600) / 60);
+              messageStr += `${userFormatRating(ranking[i])} has`;
+              if (hours > 0) messageStr += ` ${hours} hour${hours == 1 ? '' : 's'}`;
+              if (minutes > 0) messageStr += ` ${minutes} minute${minutes == 1 ? '' : 's'}`;
+              messageStr += ' left!\n';
+              messageStr += '```' + participantStr(ranking[i], i + 1) + '```';
+              await sendMessage(channelBotFeed, messageStr, ranking[i].old_rating >= 2600, 1);
+            }
+          }
+        }
+
+        // check for DQs
+        if (ranking[i].is_disqualified && !oldInfo.is_disqualified) {
+          messageStr = `${userFormatRating(ranking[i])} has been disqualified!`;
+          await sendMessage(channelBotFeed, messageStr, true, 1);
+        } else if (!ranking[i].is_disqualified && oldInfo.is_disqualified) {
+          messageStr = `${userFormatRating(ranking[i])} has been un-disqualified!`;
+          await sendMessage(channelBotFeed, messageStr, true, 1);
+        }
+
         userParticipations.set(ranking[i].user, ranking[i]);
       }
+
+      // check window
       if (Date.parse(ranking[i].end_time) <= Date.now()) {
         if (userWindowFinished.get(ranking[i].user) == undefined) {
           userWindowFinished.set(ranking[i].user, ranking[i]);
-          let messageStr = `${userFormatRating(ranking[i])}${apostrophePlural(ranking[i].user)} window is over.\n`;
+          messageStr = `${userFormatRating(ranking[i])}${apostrophePlural(ranking[i].user)} window is over.\n`;
           messageStr += '```' + participantStr(ranking[i], i + 1) + '```';
-          await sendMessage(channelBotFeed, messageStr, ranking[i].old_rating >= 2400, 1);
+          await sendMessage(channelBotFeed, messageStr, ranking[i].old_rating >= 2600, 1);
         }
+        userParticipationsTracked.delete(ranking[i].user);
       }
     }
-    lastCheck = (new Date(Date.now()).toString());
-    console.log(new Date(Date.now()).toTimeString().slice(0, 17));
+
+    lastCheck = Date.now();
+    console.log(new Date(lastCheck).toTimeString().slice(0, 17));
   } catch (error) {
     console.log(error);
   }
-  setTimeout(refreshContest, 8000);
+  setTimeout(refreshContest, 10000);
 }
 
 
@@ -192,7 +314,7 @@ client.on('messageCreate', msg => {
       return -1;
     }
     if (userInput[0] == '!check') {
-      msg.channel.send('Last update at ' + lastCheck);
+      msg.channel.send('Last update at ' + lastCheck.toString());
     } else if (userInput[0] == '!distribution') {
       let ranking = Contest.rankings;
       let numProblems = Contest.problems.length;
@@ -210,13 +332,15 @@ client.on('messageCreate', msg => {
       }
       let chartScale = Math.max(rowMaxLen / 25, 1);
       for (let i = 0; i < numProblems; i++) {
-        messageStr += `\`${setW('P' + (i + 1).toString(), 'left', 4)}\``;
+        messageStr += `\`${setW('P' + (i + 1).toString(), 'left', 3)}\``;
         let numFull = 0;
         let numPartial = 0;
+        let numAttempt = 0;
         for (let j = 0; j < ranking.length; j++) {
           if (ranking[j].solutions[i] != null) {
             if (ranking[j].solutions[i].points == Contest.problems[i].points) numFull++;
             else if (ranking[j].solutions[i].points > 0) numPartial++;
+            else if (ranking[j].solutions[i].points == 0) numAttempt++;
           }
         }
         messageStr += ':green_square:'.repeat(Math.ceil(numFull / chartScale));
@@ -231,8 +355,10 @@ client.on('messageCreate', msg => {
         '!distribution     Displays the problem solve distribution of the contest' + '\n' +
         '!help             Self explanatory' + '\n' +
         '!info             General contest info' + '\n' +
-        '!participants     Returns The total number of contest participants' + '\n' +
         '!scoreboard       Displays the contest scoreboard' + '\n' +
+        '!track            Tracks a user' + '\n' +
+        '!tracking         Displays list of tracked users' + '\n' +
+        '!untrack          Untracks a user' + '\n' +
         '!user             Displays relevant contest info about a user' + '\n' +
         '```';
       msg.channel.send(messageStr);
@@ -243,22 +369,15 @@ client.on('messageCreate', msg => {
       messageStr += `Number of problems: ${Contest.problems.length}\n`;
       messageStr += `Window length: ${(Contest.time_limit / 3600)} hours\n`;
       messageStr += `Is rated: ${(Contest.is_rated == true ? 'Yes' : 'No')}\n`;
-      msg.channel.send(messageStr);
-    } else if (userInput[0] == '!participants') {
-      let ranking = Contest.rankings;
-      if (userInput[1] != undefined) {
-        if (userInput[1] == '-active') {
-          let numActive = 0;
-          for (let i = 0; i < ranking.length; i++) {
-            if (Date.now() < Date.parse(ranking[i].end_time)) {
-              numActive++;
-            }
-          }
-          msg.channel.send(`There are ${numActive} active participants.`);
+      messageStr += `Number of participants: ${Contest.rankings.length}\n`;
+      let numActive = 0;
+      for (let i = 0; i < Contest.rankings.length; i++) {
+        if (Date.now() < Date.parse(Contest.rankings[i].end_time)) {
+          numActive++;
         }
-      } else {
-        msg.channel.send(`There are ${ranking.length} participants.`);
       }
+      messageStr += `Number of active participants: ${numActive}\n`;
+      msg.channel.send(messageStr);
     } else if (userInput[0] == '!scoreboard') {
       let ranking = Contest.rankings;
       let problem = Contest.problems;
@@ -307,6 +426,39 @@ client.on('messageCreate', msg => {
           msg.channel.send('```' + scoreboardStr + '```');
         }
         scoreboardStr = '';
+      }
+    } else if (userInput[0] == '!track') {
+      if (userInput[1] != undefined) {
+        let username = userInput[1];
+        if (userParticipationsTracked.get(username) == undefined) {
+          getLastUserSubmission(username).then((lastsub) => {
+            try {
+              userParticipationsTracked.set(username, lastsub.id);
+              msg.channel.send(`Now tracking ${username}.`);
+            } catch {
+              msg.channel.send(`${username} is not a user.`);
+            }
+          });
+        } else {
+          msg.channel.send(`${username} is already being tracked.`);
+        }
+      }
+    } else if (userInput[0] == '!tracking') {
+      let messageStr = `Currently tracking ${userParticipationsTracked.size} users:`;
+      for (let [key, value] of userParticipationsTracked) {
+
+        messageStr += `\n${userFormatRating(userParticipations.get(key))}`;
+      }
+      msg.channel.send(messageStr);
+    } else if (userInput[0] == '!untrack') {
+      if (userInput[1] != undefined) {
+        let username = userInput[1];
+        if (userParticipationsTracked.get(username) == undefined) {
+          msg.channel.send(`${username} has not been tracked.`);
+        } else {
+          userParticipationsTracked.delete(username);
+          msg.channel.send(`${username} is no longer being tracked.`);
+        }
       }
     } else if (userInput[0] == '!user') {
       if (userInput[1] != undefined) {
